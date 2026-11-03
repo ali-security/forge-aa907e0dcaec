@@ -267,5 +267,227 @@ require('../../lib/util');
         });
       });
     });
+
+    // see GHSA-hqq3-7jhf-c5jx
+    describe('record processing', function() {
+      // enough records to exhaust the call stack if each record is handled
+      // one call level deeper than the previous one
+      var COUNT = 50000;
+
+      // heartbeat_request and heartbeat_response with empty payloads
+      var HB_REQUEST = forge.util.hexToBytes('1803010003010000');
+      var HB_RESPONSE = forge.util.hexToBytes('1803010003020000');
+      // fatal handshake_failure alert
+      var ALERT = forge.util.hexToBytes('15030100020228');
+
+      function repeat(bytes, count) {
+        var b = forge.util.createBuffer();
+        for(var i = 0; i < count; ++i) {
+          b.putBytes(bytes);
+        }
+        return b.getBytes();
+      }
+
+      // TLS 1.0 record
+      function record(type, fragment) {
+        var b = forge.util.createBuffer();
+        b.putByte(type);
+        b.putByte(3);
+        b.putByte(1);
+        b.putInt16(fragment.length);
+        b.putBytes(fragment);
+        return b.getBytes();
+      }
+
+      function createConnection(server, log) {
+        return forge.tls.createConnection({
+          server: server,
+          verify: function() {
+            return true;
+          },
+          tlsDataReady: function(c) {
+            c.tlsData.getBytes();
+          },
+          dataReady: function(c) {
+            c.data.getBytes();
+          },
+          heartbeatReceived: function() {
+            log.heartbeats++;
+            if(log.heartbeats === 1 && log.throwOnFirstHeartbeat) {
+              throw new Error('heartbeat callback failed');
+            }
+          },
+          closed: function() {},
+          error: function(c, error) {
+            log.errors.push(error.message);
+          }
+        });
+      }
+
+      it('should process many heartbeat records as server', function() {
+        var log = {heartbeats: 0, errors: []};
+        var c = createConnection(true, log);
+        var rval = c.process(repeat(HB_RESPONSE, COUNT) + ALERT);
+        ASSERT.equal(rval, 0);
+        // the alert after all heartbeat records was processed
+        ASSERT.deepEqual(log.errors, ['Handshake failure.']);
+      });
+
+      it('should process many heartbeat records as client', function() {
+        var log = {heartbeats: 0, errors: []};
+        var c = createConnection(false, log);
+        c.handshake();
+        var rval = c.process(repeat(HB_REQUEST, COUNT) + ALERT);
+        ASSERT.equal(rval, 0);
+        ASSERT.deepEqual(log.errors, ['Handshake failure.']);
+      });
+
+      it('should process a message fragmented over many records', function() {
+        var log = {heartbeats: 0, errors: []};
+        var c = createConnection(true, log);
+        // ClientHello header announcing a 16 MiB message, then many 1-byte
+        // fragments of it
+        var data = record(22, forge.util.hexToBytes('01ffffff')) +
+          repeat(record(22, '\x00'), COUNT);
+        var rval = c.process(data);
+        ASSERT.equal(rval, 0);
+        ASSERT.deepEqual(log.errors, []);
+        // all records were read
+        ASSERT.equal(c.input.length(), 0);
+      });
+
+      it('should process many handshake messages per record', function() {
+        var log = {heartbeats: 0, errors: []};
+        var c = createConnection(false, log);
+        c.handshake();
+        // ServerHello: TLS 1.0, new session, TLS_RSA_WITH_AES_128_CBC_SHA
+        var b = forge.util.createBuffer();
+        b.putBytes(forge.util.hexToBytes('0301'));
+        b.fillWithByte(0, 32);
+        b.putBytes(forge.util.hexToBytes('00002f00'));
+        var serverHello = forge.util.hexToBytes('02') +
+          forge.util.int32ToBytes(b.length()).substr(1) + b.getBytes();
+        // records full of 4-byte HelloRequest messages
+        var helloRequests = repeat(
+          record(22, repeat(forge.util.hexToBytes('00000000'), 4096)),
+          Math.ceil(COUNT / 4096));
+        var rval = c.process(record(22, serverHello) + helloRequests + ALERT);
+        ASSERT.equal(rval, 0);
+        ASSERT.deepEqual(log.errors, ['Handshake failure.']);
+      });
+
+      it('should process records split across calls', function() {
+        var log = {heartbeats: 0, errors: []};
+        var c = createConnection(true, log);
+        var data = repeat(HB_RESPONSE, 3) + ALERT;
+        var rvals = [];
+        for(var i = 0; i < data.length; ++i) {
+          rvals.push(c.process(data.charAt(i)));
+        }
+        // bytes needed for the next header or fragment, 0 when complete
+        ASSERT.deepEqual(rvals.slice(0, 8), [4, 3, 2, 1, 3, 2, 1, 0]);
+        ASSERT.deepEqual(log.errors, ['Handshake failure.']);
+      });
+
+      it('should continue processing after a callback throws', function() {
+        var log = {heartbeats: 0, errors: [], throwOnFirstHeartbeat: true};
+        var c = createConnection(false, log);
+        c.prepareHeartbeatRequest('');
+        ASSERT.throws(function() {
+          c.process(repeat(HB_RESPONSE, 2) + ALERT);
+        }, /heartbeat callback failed/);
+        ASSERT.equal(log.heartbeats, 1);
+        ASSERT.deepEqual(log.errors, []);
+        // the remaining buffered records are still processed
+        ASSERT.equal(c.process(), 0);
+        ASSERT.equal(log.heartbeats, 2);
+        ASSERT.deepEqual(log.errors, ['Handshake failure.']);
+      });
+
+      it('should process many application data records', function() {
+        // every record is encrypted and decrypted
+        this.timeout(120000);
+
+        var keys = forge.pki.rsa.generateKeyPair(512);
+        var cert = forge.pki.createCertificate();
+        cert.publicKey = keys.publicKey;
+        cert.serialNumber = '01';
+        cert.validity.notBefore = new Date();
+        cert.validity.notAfter = new Date();
+        cert.validity.notAfter.setFullYear(
+          cert.validity.notBefore.getFullYear() + 1);
+        cert.setSubject([{name: 'commonName', value: 'server'}]);
+        cert.setIssuer([{name: 'commonName', value: 'server'}]);
+        cert.sign(keys.privateKey);
+        var serverCert = forge.pki.certificateToPem(cert);
+        var serverKey = forge.pki.privateKeyToPem(keys.privateKey);
+
+        var end = {};
+        var errors = [];
+        // client records are captured here instead of being sent right away
+        var records = null;
+        var received = 0;
+        end.client = forge.tls.createConnection({
+          server: false,
+          verify: function() {
+            return true;
+          },
+          connected: function() {},
+          tlsDataReady: function(c) {
+            var bytes = c.tlsData.getBytes();
+            if(records) {
+              records.push(bytes);
+            } else {
+              end.server.process(bytes);
+            }
+          },
+          dataReady: function(c) {
+            c.data.getBytes();
+          },
+          closed: function() {},
+          error: function(c, error) {
+            errors.push(error.message);
+          }
+        });
+        end.server = forge.tls.createConnection({
+          server: true,
+          getCertificate: function() {
+            return serverCert;
+          },
+          getPrivateKey: function() {
+            return serverKey;
+          },
+          connected: function() {},
+          tlsDataReady: function(c) {
+            end.client.process(c.tlsData.getBytes());
+          },
+          dataReady: function(c) {
+            received += c.data.getBytes().length;
+          },
+          closed: function() {},
+          error: function(c, error) {
+            errors.push(error.message);
+          }
+        });
+
+        end.client.handshake();
+        ASSERT.deepEqual(errors, []);
+        ASSERT.equal(end.client.isConnected, true);
+        ASSERT.equal(end.server.isConnected, true);
+
+        // one application data record per call
+        records = [];
+        for(var i = 0; i < COUNT; ++i) {
+          end.client.prepare('x');
+        }
+        ASSERT.equal(records.length, COUNT);
+
+        var rval = end.server.process(records.join(''));
+        ASSERT.equal(rval, 0);
+        ASSERT.deepEqual(errors, []);
+        // all application data records were processed
+        ASSERT.equal(received, COUNT);
+      });
+    });
   });
 })();
