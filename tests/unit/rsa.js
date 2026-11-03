@@ -10,6 +10,16 @@ var RSA = require('../../lib/rsa');
 var UTIL = require('../../lib/util');
 
 (function() {
+  // seal: names + reasons of skipped tests, printed after the whole run
+  var SKIPPED_TESTS = [];
+  after(function() {
+    console.log('Skipped tests (' + SKIPPED_TESTS.length + '):' +
+      (SKIPPED_TESTS.length ? '' : ' none'));
+    SKIPPED_TESTS.forEach(function(entry) {
+      console.log('  SKIPPED ' + entry);
+    });
+  });
+
   var _pem = {
     privateKey: '-----BEGIN RSA PRIVATE KEY-----\r\n' +
       'MIICXQIBAAKBgQDL0EugUiNGMWscLAVM0VoMdhDZEJOqdsUMpx9U0YZI7szokJqQ\r\n' +
@@ -156,6 +166,20 @@ var UTIL = require('../../lib/util');
       return true;
     }
 
+    // seal: record why each determinism test is skipped so the reason is
+    // printed in the CI log (mocha/karma only print a bare pending count)
+    function skipNonDeterministic(ctx) {
+      var reason = UTIL.isNodejs ?
+        'Node.js >= 10.12 uses native crypto.generateKeyPair(Sync), which ' +
+        'ignores the seeded PRNG and is non-deterministic' :
+        'async browser key generation races across multiple web workers ' +
+        'and is non-deterministic';
+      var entry = 'rsa > ' + ctx.test.title + ': ' + reason;
+      SKIPPED_TESTS.push(entry);
+      console.log('    SKIPPED ' + entry);
+      ctx.skip();
+    }
+
     it('should generate 512 bit key pair (sync)', function() {
       _genSync();
     });
@@ -207,7 +231,7 @@ var UTIL = require('../../lib/util');
       function() {
       if(!isDeterministic(true, false, false) ||
         !isDeterministic(true, false, true)) {
-        this.skip();
+        skipNonDeterministic(this);
       }
       var pair1 = _genSync({samePrng: true});
       // save
@@ -224,7 +248,7 @@ var UTIL = require('../../lib/util');
       '(prng+sync+purejs,prng+sync+purejs)', function() {
       if(!isDeterministic(true, false, true) ||
         !isDeterministic(true, false, true)) {
-        this.skip();
+        skipNonDeterministic(this);
       }
       // save
       var purejs = FORGE.options.usePureJavaScript;
@@ -241,7 +265,7 @@ var UTIL = require('../../lib/util');
       function(done) {
       if(!isDeterministic(true, false, false) ||
         !isDeterministic(true, true, false)) {
-        this.skip();
+        skipNonDeterministic(this);
       }
       var pair1 = _genSync({samePrng: true});
       _genAsync({samePrng: true}, function(pair2) {
@@ -254,7 +278,7 @@ var UTIL = require('../../lib/util');
       function(done) {
       if(!isDeterministic(true, true, false) ||
         !isDeterministic(true, false, false)) {
-        this.skip();
+        skipNonDeterministic(this);
       }
       _genAsync({samePrng: true}, function(pair1) {
         var pair2 = _genSync({samePrng: true});
@@ -267,7 +291,7 @@ var UTIL = require('../../lib/util');
       function(done) {
       if(!isDeterministic(true, true, false) ||
         !isDeterministic(true, true, false)) {
-        this.skip();
+        skipNonDeterministic(this);
       }
       var pair1;
       var pair2;
